@@ -1,0 +1,120 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+
+library(arrow)
+library(tidyverse)
+```
+
+```{r}
+
+comdata = . %>% str_glue("https://www.fec.gov/files/bulk-downloads/{.}/committee_summary_{.}.csv")
+
+seq(2020, 2008, -2) %>% map(comdata) %>%
+  discard(~file.exists(basename(.x))) %>%
+  map(~download.file(.x, cacheOK = TRUE, destfile = basename(.x)))
+
+data = seq(2020, 2008, -2) %>% map(~read_csv(comdata(.x) %>% basename) %>% mutate(year = .x))
+
+recent = data[[1]]
+basics = recent %>% select(filer_committee_id_number = CMTE_ID, CMTE_NM, CMTE_TP, INDV_CONTB, TTL_CONTB)
+
+```
+
+
+```{r}
+
+library(openssl)
+
+add_id = . %>% mutate(contributor_id = str_c(contributor_first_name, contributor_last_name, contributor_organization_name, contributor_zip_code %>% str_sub(1, 5)) %>% toupper %>% md5)
+
+
+files = list.files("cache", full.names = TRUE) %>% map(list.files, full.names = TRUE) %>%
+  flatten() %>% keep(~str_detect(.x, ".parquet")) %>%
+  flatten
+
+?read_parquet
+
+many_parquets = files %>% keep(str_detect, "SA11|SA17") %>%
+  map_dfr(~safely(read_parquet, tibble())(.x) %>% pluck("result"))
+
+one_percent = many_parquets %>% sample_frac(.01)
+
+basics %>% inner_join(one_percent %>% filter(filer_committee_id_number == "C00401224"))
+
+```
+
+
+```{r}
+?case_when()
+usable = many_parquets %>% 
+  mutate(recipient = case_when(
+    str_detect(memo_text_description, "C00") ~ str_extract(memo_text_description, "C00[0-9]+"), 
+    TRUE ~ filer_committee_id_number)) %>% 
+  select(recipient, contributor_organization_name, contributor_last_name, contributor_first_name, contributor_street_1, contributor_city, contributor_state, contributor_zip_code, contribution_date, contribution_amount, contributor_employer, contributor_occupation) %>%
+  add_id
+
+# usable %>% distinct(contributor_organization_name, contributor_id, contributor_last_name, contributor_first_name, contributor_street_1, contributor_city, contributor_state, contributor_zip_code, contribution_date, contribution_amount, contributor_employer)
+
+all_edges = usable %>% distinct(contributor_id, recipient)
+
+edges_for_multiple_contributions = all_edges %>% count(contributor_id) %>% filter(n > 4) %>% inner_join(all_edges) %>% select(-n)
+edges_for_multiple_incoming = edges_for_multiple_contributions %>% count(recipient) %>% filter(n > 10) %>% 
+  inner_join(edges_for_multiple_contributions) %>% select(-n)
+
+
+cont_ids = edges_for_multiple_incoming %>% distinct(contributor_id) %>% mutate(cont_id = 1:n())
+filer_ids = edges_for_multiple_incoming %>% distinct(recipient) %>% mutate(filer_id = (max(cont_ids$cont_id) + 1):(n() + max(cont_ids$cont_id)))
+
+usable %>% sample_n(10)
+
+id_lookup = cont_ids %>% rename(id=cont_id, contributor_id = contributor_id) %>%
+  bind_rows(filer_ids %>% rename(id=filer_id, recipient = recipient))
+
+edges_for_multiple_incoming %>% inner_join(cont_ids) %>% inner_join(filer_ids) %>% select(filer_id, cont_id) %>% write_delim("~/contribs.edgelist", delim = "\t", col_names = FALSE)
+
+
+```
+
+```{R}
+
+umapped = read_csv("~/umap.csv", col_names = c("x", "y")) %>% mutate(id = 1:n()) %>% inner_join(id_lookup) %>%
+  mutate(type = ifelse(is.na(filer_committee_id_number), "contributor", "committee"))
+
+
+library(tidyverse)
+umapped %>% filter(!is.na(filer_committee_id_number))
+library(ggrepel)
+umapped %>% inner_join(basics) %>% arrange(-TTL_CONTB) %>% head(50) %>% ggplot() + geom_point(aes(x = x, y = y, color=type)) +
+  geom_label_repel(aes(x=x, y = y, label=CMTE_NM), size = 2)
+
+```
+```{python}
+import umap
+
+
+
+mapper = umap.UMAP(metric='cosine', random_state=42, low_memory=True).fit(factor_matrix)
+
+
+```
+```{r}
+usable %>% write_parquet("tmp.parquet")
+
+
+usable %>% head
+
+usable %>% arrange(-contribution_amount) %>% head(20) %>% inner_join(basics)
+
+
+usable
+
+library(tidyverse)
+data %>% filter(contributor_city %>% str_detect(regex("New York", ignore_case = TRUE))) %>% filter(!is.na(contributor_last_name)) %>%
+  filter(str_detect(contributor_street_1, regex("Bleecker", ignore_case = TRUE)))
+
+data %>% group_by(contributor_occupation) %>% summarize(n = n(), z = sum(contribution_amount), average = mean(contribution_amount)) %>% arrange(-n) %>% head(100) 
+```
